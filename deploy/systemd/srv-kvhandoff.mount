@@ -1,0 +1,18 @@
+# The export store: a dedicated tmpfs, not /dev/shm (RemoveIPC only cleans /dev/shm and /dev/mqueue). Example path and
+# size; size it from README "Sizing" (slots x largest export). The unit name must match Where= (systemd-escape -p).
+# noswap (Linux 6.4+): without it an idle store is pushed to swap whenever another process needs memory, and the next
+# export pays to swap it back in. With it every written byte is pinned RAM until the slot file is removed, so size= is
+# the cap on pinned memory: keep it below what --gpu-memory-utilization and the host's other services leave free.
+# `kvhandoff-store check --require-noswap` checks it.
+[Unit]
+Description=kvhandoff export store (tmpfs)
+Before=kvhandoff-transfer@.service
+
+[Mount]
+What=tmpfs
+Where=/srv/kvhandoff
+Type=tmpfs
+Options=size=64G,mode=2750,uid=980,gid=980,nosuid,nodev,noexec,noswap
+
+[Install]
+WantedBy=local-fs.target

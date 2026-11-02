@@ -1,0 +1,41 @@
+# kvhandoff transfer service, one instance per prefill-decode pair: systemctl enable --now kvhandoff-transfer@<pair>.
+# Example paths: /opt/kvhandoff (venv with kvhandoff installed), /etc/kvhandoff (config and secrets), /srv/kvhandoff
+# (store mount). Your secret provisioning puts the pair's token at /etc/kvhandoff/<pair>.token
+# (0640 root:kvhandoff). systemd hands the service a private copy at
+# $CREDENTIALS_DIRECTORY/token (0400, owned by the service user), so /etc/kvhandoff/<pair>.transfer.toml sets
+# token_file = "/run/credentials/kvhandoff-transfer@<pair>.service/token" and needs no allow_group_readable_token.
+# Rotation: refetch the token, then restart this instance and EXO on the bridge host (no dual-token support).
+[Unit]
+Description=kvhandoff transfer service for pair %i (vLLM KV exports to EXO)
+Requires=srv-kvhandoff.mount
+After=srv-kvhandoff.mount network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kvhandoff
+Group=kvhandoff
+LoadCredential=token:/etc/kvhandoff/%i.token
+ExecStart=/opt/kvhandoff/venv/bin/kvhandoff-transfer --config /etc/kvhandoff/%i.transfer.toml
+Restart=on-failure
+RestartSec=2
+# hardening: read-only system, the store is the only writable path (release markers)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/kvhandoff
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

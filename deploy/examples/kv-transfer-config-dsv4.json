@@ -1,0 +1,5 @@
+{"kv_connector": "KVHandoffDSV4Connector",
+ "kv_connector_module_path": "kvhandoff.vllm.dsv4_connector",
+ "kv_role": "kv_producer",
+ "kv_connector_extra_config": {"store_path": "/srv/kvhandoff/dsv4", "slots": 16, "hold_seconds": 120,
+                               "model_id": "deepseek-v4-flash", "rerope": "ratio0", "timing_log": true}}

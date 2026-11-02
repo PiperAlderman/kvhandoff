@@ -1,0 +1,15 @@
+# EXO bridge, DeepSeek V4 (set KVHANDOFF_BRIDGE_CONFIG=<this file> in the EXO process's environment).
+[bridge]
+mode = "dsv4"
+vllm_url = "http://192.0.2.22:8000"
+vllm_model = "deepseek-v4-flash"
+vllm_api_key_file = "/etc/kvhandoff/pair-a.vllm.key"   # the API key of the vLLM launched with the connector (VLLM_API_KEY env-file)
+transfer_url = "http://192.0.2.11:8093"
+transfer_token_file = "/etc/kvhandoff/pair-a.token"   # the pair's token, 0640 root:kvhandoff; EXO's user is in group kvhandoff
+allow_group_readable_token = true
+timeout_s = 50                 # under EXO's 60 s client socket timeout
+max_inflight = 4
+fetch_threads = 8
+result_cache_entries = 8
+result_cache_bytes = 4294967296
+expect_model_id = "deepseek-v4-flash"

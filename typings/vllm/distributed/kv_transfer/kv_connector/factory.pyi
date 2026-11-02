@@ -1,0 +1,3 @@
+class KVConnectorFactory:
+    @classmethod
+    def register_connector(cls, name: str, module_path: str, class_name: str) -> None: ...

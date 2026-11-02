@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvhandoff"
+version = "0.1.0"
+description = "Hand a vLLM prefill (KV cache) to EXO/MLX decode: vLLM KV-connector plugin, export store, transfer service and a thin EXO integration"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The kvhandoff Authors" }]
+keywords = ["vllm", "kv-cache", "disaggregated-prefill", "mlx", "exo"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# No hard dependencies: the core (header, store, transfer service, EXO bridge) is stdlib only, so the package can be
+# installed with --no-deps into the vLLM container (which brings its own torch) and into EXO's venv (numpy, msgspec).
+dependencies = []
+
+[project.optional-dependencies]
+producer = ["torch>=2.4"]           # the vLLM side (already present in the vLLM image; do not let pip replace it)
+bridge = ["numpy>=1.26"]            # the EXO side (EXO already has numpy and msgspec)
+dev = ["torch>=2.4", "numpy>=1.26", "msgspec>=0.18", "pytest>=8", "ruff>=0.14", "basedpyright>=1.37"]
+
+[project.scripts]
+kvhandoff-transfer = "kvhandoff.transfer.server:main"
+kvhandoff-exo-hook = "kvhandoff.exo.hook:main"
+kvhandoff-store = "kvhandoff.store:main"
+
+# vLLM loads every "vllm.general_plugins" entry point in every process; register() adds both connectors by name so
+# kv_connector_module_path can be left out of --kv-transfer-config.
+[project.entry-points."vllm.general_plugins"]
+kvhandoff = "kvhandoff.vllm.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+kvhandoff = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["compat", "fakes", "data"]
+pythonpath = ["src", "tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 128
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "BLE", "N", "PL"]
+ignore = [
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",  # complexity and magic-number rules: too noisy for byte layouts
+  "S101",                                                  # assert is used in tests
+  "N818",                                                  # exception names read better without an Error suffix here
+  "PLW0603",                                               # module singletons (logging set-up, the EXO bridge) are deliberate
+  "PLR0917",                                               # converter helpers keep the prototype's positional signatures
+  "RUF001", "RUF002", "RUF003",                            # ambiguous unicode in prose
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/compat/**" = ["E402"]                       # sys.path is set before the imports
+"tests/**" = ["S", "PLC0415", "N802", "N803", "N806"]
+"tests/test_{dsv4,exo_bridge,layerwise,paged,prefault,vllm_connectors}.py" = ["E402"]  # imports after importorskip("torch")
+"src/kvhandoff/vllm/**" = ["PLC0415"]   # vLLM imports stay inside functions where the module may run without vLLM
+"src/kvhandoff/exo/**" = ["PLC0415"]
+"src/kvhandoff/transfer/client.py" = ["S310"]           # URL schemes are restricted to http(s) by config.py
+"src/kvhandoff/producer/dsv4*.py" = ["N803", "N806"]    # T, W, L: the prototype's (and the papers') names
+
+[tool.basedpyright]
+include = ["src", "tests"]
+exclude = ["tests/compat"]                 # needs MLX and EXO (see tests/compat/README.md)
+stubPath = "typings"
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportMissingModuleSource = false       # vLLM is type-checked against typings/vllm (stubs), not installed
+reportUnknownMemberType = false        # torch's dynamic attributes (Tensor ops) are partly untyped
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportPrivateUsage = false             # the connectors read vLLM base-class attributes (_vllm_config, ...)
+reportUnusedCallResult = false
+reportAny = false
+reportExplicitAny = false
+reportUnannotatedClassAttribute = false
+reportImplicitOverride = false
+reportMissingSuperCall = false
+reportUnknownLambdaType = false

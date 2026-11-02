@@ -1,0 +1,12 @@
+# kvhandoff transfer service for pair "pair-a" (/etc/kvhandoff/pair-a.transfer.toml, unit kvhandoff-transfer@pair-a).
+# Every value here is an example; nothing has a built-in address or path default.
+[transfer]
+bind = "192.0.2.11"            # the address the EXO bridge reaches (e.g. the RoCE link address on the vLLM rank-0 host)
+port = 8093
+store_path = "/srv/kvhandoff/dsv4"
+token_file = "/run/credentials/kvhandoff-transfer@pair-a.service/token"   # LoadCredential copy of /etc/kvhandoff/pair-a.token
+hold_seconds = 120             # report only; must match the connector's hold_seconds
+max_concurrent_transfers = 16  # /v1 requests served at once; more get 503 + Retry-After
+max_connections = 64
+io_timeout_s = 30
+log_level = "info"

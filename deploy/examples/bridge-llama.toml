@@ -1,0 +1,15 @@
+# EXO bridge, Llama-style (paged KV), with vLLM on the same host.
+[bridge]
+mode = "paged"
+vllm_url = "http://127.0.0.1:8092"
+vllm_model = "llama70b"
+transfer_url = "http://127.0.0.1:8094"                 # or local_store_path = "/srv/kvhandoff/llama" (needs the store's group)
+transfer_token_file = "/etc/kvhandoff/pair-b.token"   # the pair's token, 0640 root:kvhandoff; EXO's user is in group kvhandoff
+allow_group_readable_token = true
+vllm_api_key_file = "/etc/kvhandoff/pair-b.vllm.key"   # the API key of the vLLM launched with the connector (VLLM_API_KEY env-file)
+timeout_s = 50                 # prefill + export + first layer; each later layer gets its own timeout_s
+block_size = 16                # vLLM --block-size; pad_tokens defaults to block_size + 1 (as hardware-tested)
+wire_dtype = "float16"         # what the MLX model expects (Llama 4-bit MLX: fp16)
+expect_model_id = "llama70b"
+# stream_layers = true         # send each layer while vLLM still prefills (docs/layerwise.md); also set
+                               # "stream_layers": true in kv_connector_extra_config. Off by default.
