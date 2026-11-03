@@ -91,6 +91,9 @@ class KVHandoffDSV4Connector(KVConnectorBase_V1, SupportsHMA):
     # ------------------------------------------------------------------ worker side
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._kv = dict(kv_caches)
+        if self._cfg.presize_tokens > 0 and self._tp_rank() == 0:  # at start-up, not on the first request
+            tokens = min(self._cfg.presize_tokens, int(self._vllm_config.model_config.max_model_len))
+            self._exporter_for_rank0().presize(tokens)
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         return
@@ -153,6 +156,7 @@ class KVHandoffDSV4Connector(KVConnectorBase_V1, SupportsHMA):
                 rerope=self._cfg.rerope,
                 rope_check_layers=self._cfg.rope_check_layers,
                 timing_log=self._cfg.timing_log,
+                prefault_slot_maps=self._cfg.prefault_slot_maps,
             )
         return self._exporter
 

@@ -102,6 +102,13 @@ class ConnectorConfig:
     # On by default: with a noswap store (see README) it removes the cold copy cost. On a swappable store the cold
     # penalty is the store coming back from swap, which this cannot help.
     prefault_slot_maps: bool = True
+    # dsv4 only: at start-up (register_kv_caches, TP rank 0) size, allocate and pre-fault every slot's layer files for
+    # prompts of up to this many tokens (capped at max_model_len; 0 turns it off), so no request pays for a fresh slot
+    # file (about 0.2 s at 2k, measured). V4 Flash at 32768: about 245 MB per slot, 3.9 GB for the 16 default slots,
+    # resident from start-up on a noswap store. Skipped (logged) if that is over half the store's free bytes. The
+    # paged connector ignores it: its slot files hold max_model_len rows of every layer (about 10.7 GB per slot for a
+    # 70B at 32k), and it already reserves and pre-faults only the rows each export uses.
+    presize_tokens: int = 32768
 
     @classmethod
     def from_extra(cls, extra: Mapping[str, Any] | None) -> ConnectorConfig:
@@ -133,6 +140,7 @@ class ConnectorConfig:
             stream_layers=_bool(d, "stream_layers", False, where),
             direct_plane_copy=_bool(d, "direct_plane_copy", True, where),
             prefault_slot_maps=_bool(d, "prefault_slot_maps", True, where),
+            presize_tokens=_int(d, "presize_tokens", 32768, where) or 0,
         )
 
 

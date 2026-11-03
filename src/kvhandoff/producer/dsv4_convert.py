@@ -247,6 +247,34 @@ def convert_layer(src: LayerSources, T: int) -> list[Blob]:
     return blobs
 
 
+def layer_nbytes(T: int, ratio: int) -> int:
+    """Bytes of convert_layer(src, T)'s blobs for a layer with compress ratio ``ratio``, without converting anything.
+
+    Same arithmetic as convert_layer and _branch: the float32 header (6 fields, then 8 per branch), the window K and V
+    (bf16 [min(T, 128), 512] each), then per branch the buffer kv and gate (T mod ratio rows of coff*d), the ratio-4
+    previous window (4 rows of coff*d, each of kv and gate) and the pool (T // ratio rows of d), all bf16."""
+    if T < 1:
+        raise ValueError(f"T must be >= 1, got {T}")
+    w = min(T, WINDOW)
+    total = 4 * (6 + 2 * (BRANCH_ARRAYS + 3)) + 2 * (w * HEAD * 2)
+    branches = ([(ratio, HEAD)] if ratio else []) + ([(4, IDX_DIM)] if ratio == 4 else [])
+    for r, d in branches:
+        width = (2 if r == 4 else 1) * d
+        n, rem = divmod(T, r)
+        total += 2 * rem * width * 2  # buffer_kv, buffer_gate
+        if r == 4 and n >= 1:
+            total += 2 * r * width * 2  # prev_kv, prev_gate
+        total += n * d * 2  # pool
+    return total
+
+
+def layer_capacity(T: int, ratio: int) -> int:
+    """The most bytes any prompt of 1 to T tokens needs for this layer. Sizes are not monotonic in T (the buffer rows
+    restart at every multiple of the ratio), but for each t <= T - 128 some t' in (T - 128, T] has the same remainder
+    (both ratios divide 128) and a window and pool at least as large, so the last 128 lengths are enough."""
+    return max(layer_nbytes(t, ratio) for t in range(max(1, T - WINDOW + 1), T + 1))
+
+
 def blob_bytes(t: torch.Tensor) -> torch.Tensor:
     """Flat little-endian byte view of a tensor (bf16 as its raw 16-bit words, like EXO's array_to_bytes)."""
     return t.contiguous().view(torch.uint8).reshape(-1)

@@ -67,11 +67,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/compat/**" = ["E402"]                       # sys.path is set before the imports
 "tests/**" = ["S", "PLC0415", "N802", "N803", "N806"]
-"tests/test_{dsv4,exo_bridge,layerwise,paged,prefault,vllm_connectors}.py" = ["E402"]  # imports after importorskip("torch")
+"tests/test_{dsv4,exo_bridge,layerwise,paged,prefault,short_prompt_overhead,vllm_connectors}.py" = ["E402"]  # imports after importorskip("torch")
 "src/kvhandoff/vllm/**" = ["PLC0415"]   # vLLM imports stay inside functions where the module may run without vLLM
 "src/kvhandoff/exo/**" = ["PLC0415"]
 "src/kvhandoff/transfer/client.py" = ["S310"]           # URL schemes are restricted to http(s) by config.py
 "src/kvhandoff/producer/dsv4*.py" = ["N803", "N806"]    # T, W, L: the prototype's (and the papers') names
+"bench/short_prompt_overhead_bench.py" = ["PLC0415", "S108"]  # imports follow the tree given on the command line
 
 [tool.basedpyright]
 include = ["src", "tests"]

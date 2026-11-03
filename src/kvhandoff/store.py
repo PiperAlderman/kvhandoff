@@ -48,7 +48,9 @@ import os
 import shutil
 import stat
 import sys
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final
@@ -234,6 +236,53 @@ def _read_header(slot_dir: str) -> ExportHeader | None:
             return ExportHeader.from_json(f.read())
     except (OSError, FormatError):
         return None
+
+
+class HeaderCache:
+    """Parsed header.json per slot, for readers that open the same export once per layer (the transfer service serves
+    each layer request with ExportReader.open, 43 of them per DeepSeek V4 hand-off). Parsing a 43 kB header took
+    2.4 ms on an x86 test VM, serialised by the GIL across the request threads: about 0.1 s per hand-off (3/11).
+
+    An entry is keyed by the header file's (device, inode, size, mtime, ctime) as seen through an open descriptor, so
+    a hit is the same file that was parsed: the writer only ever replaces header.json by rename (_write_file_atomic),
+    which gives it a new inode, so a republished or reused slot never matches an old entry. Callers still take the
+    slot's shared lock and check tag and seq on every open, exactly as without the cache. Thread safe, bounded (LRU).
+    """
+
+    def __init__(self, max_entries: int = 256):
+        self.max_entries = max(1, max_entries)
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[str, tuple[tuple[int, int, int, int, int], ExportHeader]] = OrderedDict()
+        self.parses = 0  # headers parsed (tests and benchmarks)
+
+    def read(self, slot_dir: str) -> ExportHeader | None:
+        """The slot's header (None if absent or unreadable), parsed only when the file changed since the last read."""
+        try:
+            fd = os.open(os.path.join(slot_dir, "header.json"), os.O_RDONLY)
+        except OSError:
+            return None
+        try:
+            st = os.fstat(fd)
+            key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            with self._lock:
+                hit = self._entries.get(slot_dir)
+                if hit is not None and hit[0] == key:
+                    self._entries.move_to_end(slot_dir)
+                    return hit[1]
+            with os.fdopen(os.dup(fd), "rb") as f:
+                raw = f.read()
+            h = ExportHeader.from_json(raw)
+        except (OSError, FormatError):
+            return None
+        finally:
+            os.close(fd)
+        with self._lock:
+            self.parses += 1
+            self._entries[slot_dir] = (key, h)
+            self._entries.move_to_end(slot_dir)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+        return h
 
 
 def _link(root: str, area: str, tag: str, k: int) -> None:
@@ -694,6 +743,7 @@ class ExportReader:
     def __init__(self, root: str):
         self.root = root
         self._slots_dir = os.path.realpath(os.path.join(root, "slots"))
+        self.headers = HeaderCache()
 
     def _slot_of(self, tag: str, area: str = "tags") -> str | None:
         if not is_valid_tag(tag):
@@ -710,7 +760,7 @@ class ExportReader:
         """The header of a published export. Raises ExportFailed for a failure record, else ExportNotFound."""
         d = self._slot_of(tag)
         if d is not None:
-            h = _read_header(d)
+            h = self.headers.read(d)
             if h is not None and h.tag == tag:
                 return h
         if is_valid_tag(tag):
@@ -736,7 +786,7 @@ class ExportReader:
         except BlockingIOError:
             os.close(fd)
             raise ExportNotFound(f"export {tag!r}: its slot is being rewritten") from None
-        h = _read_header(d)
+        h = self.headers.read(d)
         if h is None or h.tag != tag or (seq is not None and h.seq != seq):
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
@@ -782,7 +832,7 @@ class ExportReader:
         except BlockingIOError:
             os.close(fd)
             raise ExportNotFound(f"export {tag!r}: its slot is being rewritten") from None
-        h = _read_header(d)
+        h = self.headers.read(d)
         if h is not None and h.tag == tag and h.seq == seq:
             return OpenExport(h, d, fd)
         st = _read_stream(d)  # read under the stream log's LOCK_SH, after the slot's LOCK_SH: see the module docstring
@@ -797,7 +847,7 @@ class ExportReader:
         d = self._slot_of(tag)
         if d is None:
             return False
-        h = _read_header(d)
+        h = self.headers.read(d)
         if h is None or h.tag != tag or h.seq != seq:
             return False
         try:

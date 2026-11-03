@@ -28,7 +28,7 @@ from kvhandoff.interchange import KIND_DSV4, BlobRef, ExportHeader, LayerRef, Ro
 from kvhandoff.logs import get_logger
 from kvhandoff.producer import dsv4_convert as cv
 from kvhandoff.producer.maps import SlotMaps
-from kvhandoff.store import ExportStore, StoreError, StoreFull
+from kvhandoff.store import ExportStore, StoreError, StoreFull, store_mount, swap_problem
 from kvhandoff.tags import requested_tag, safe_tag
 
 log = get_logger("producer.dsv4")
@@ -158,8 +158,19 @@ class DSV4ModelInfo:
     producer: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
+# presize() goes ahead only if what it still has to allocate is at most this share of the store's free bytes, so a
+# small or shared store is never filled by slots that may never see a long prompt.
+PRESIZE_MAX_FREE_SHARE = 0.5
+
+
 class DSV4Exporter:
-    """Exports one finished request into a slot (TP rank 0). Failures become failure records, never exceptions."""
+    """Exports one finished request into a slot (TP rank 0). Failures become failure records, never exceptions.
+
+    Slot files: the first export into a fresh slot file (or into one a longer prompt outgrew) remapped, fallocated and
+    faulted in new tmpfs pages, about 0.2 s at 2k against 0.017 s into a used slot (measured). ``presize()``
+    (called once at start-up by the connector) does that work for every slot before the first request, and
+    ``prefault_slot_maps`` populates the page tables of any range an export grows into, as the paged writer does.
+    """
 
     def __init__(
         self,
@@ -169,6 +180,7 @@ class DSV4Exporter:
         rerope: str = "ratio0",
         rope_check_layers: int = 3,
         timing_log: bool = False,
+        prefault_slot_maps: bool = True,
     ):
         self.store = store
         self.maps = SlotMaps(store)
@@ -176,9 +188,64 @@ class DSV4Exporter:
         self.rerope = rerope
         self.rope_check_layers = rope_check_layers
         self.timing_log = timing_log
+        self.prefault_slot_maps = prefault_slot_maps
         rope = info.rope_cfg
         self.plain = cv.mlx_inv_freq(cv.ROPE, float(rope["rope_theta"]), None)
         self.comp_yarn = cv.mlx_inv_freq(cv.ROPE, float(rope["compress_rope_theta"]), rope["rope_scaling"])
+
+    def layer_capacities(self, tokens: int) -> list[int]:
+        """Bytes each layer file needs for any prompt of up to ``tokens`` tokens."""
+        return [cv.layer_capacity(tokens, r) for r in self.info.compress_ratios[: self.info.num_layers]]
+
+    def presize(self, tokens: int, *, max_free_share: float = PRESIZE_MAX_FREE_SHARE) -> dict[str, Any]:
+        """Size, allocate and pre-fault every slot's layer files for prompts of up to ``tokens`` tokens.
+
+        Done once, at start-up (the connector's register_kv_caches on TP rank 0), so no request pays for it. Pages
+        another process already allocated (slot files persist across vLLM restarts) cost nothing to reserve; only the
+        rest counts against ``max_free_share`` of the store's free bytes, and above that nothing is done (logged).
+        On a store that can swap, the pages may be swapped out again by the next memory squeeze, so it is logged.
+        Never raises: a store that fills up part way stops it, and exports size their files as before.
+        Returns what it did (also logged as ``presized``)."""
+        out: dict[str, Any] = {"tokens": tokens, "slots": self.store.slots, "done": False}
+        if tokens < 1:
+            return out
+        caps = self.layer_capacities(tokens)
+        total = sum(caps) * self.store.slots
+        have = 0
+        for k in range(self.store.slots):
+            for i, cap in enumerate(caps):
+                try:
+                    st = os.stat(os.path.join(self.store.slot_dir(k), f"L{i}.bin"))
+                except FileNotFoundError:
+                    continue
+                have += min(st.st_blocks * 512, cap)
+        st_fs = os.statvfs(self.store.root)
+        free = st_fs.f_bavail * st_fs.f_frsize
+        out.update(bytes=total, allocated_before=have, fs_free_bytes=free)
+        if total - have > max_free_share * free:
+            log.warning(
+                "presize_skipped",
+                reason=f"needs {total - have} more bytes, over {max_free_share:.0%} of the store's {free} free bytes",
+                tokens=tokens,
+                slots=self.store.slots,
+            )
+            return out
+        swap = swap_problem(store_mount(self.store.root))
+        if swap:
+            log.warning("presize_swappable_store", reason=swap)
+        t0 = time.perf_counter()
+        populated = k = i = 0
+        try:
+            for k in range(self.store.slots):
+                for i, cap in enumerate(caps):
+                    populated += self.maps.presize(k, f"L{i}.bin", cap, prefault=self.prefault_slot_maps)
+        except (StoreError, OSError) as exc:
+            log.warning("presize_stopped", error=f"{type(exc).__name__}: {exc}", slot=k, layer=i)
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            return out
+        out.update(done=True, populated=populated, seconds=round(time.perf_counter() - t0, 3))
+        log.info("presized", **out)
+        return out
 
     def rope_info(self) -> RopeInfo:
         r = self.info.rope_cfg
@@ -317,6 +384,8 @@ class DSV4Exporter:
         fname = f"L{idx}.bin"
         dst = self.maps.bytes_map(k, fname, off)
         self.store.reserve(k, fname, 0, off)  # ENOSPC becomes a failure record instead of SIGBUS
+        if self.prefault_slot_maps:  # after reserve: the pages exist; a range presize() already covered costs nothing
+            self.maps.prefault(k, fname, 0, off)
         o = 0
         for b in flat:
             dst[o : o + b.numel()].copy_(b)  # device -> shared host map (same physical memory on GB10)

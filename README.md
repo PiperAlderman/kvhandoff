@@ -61,7 +61,7 @@ A hand-off takes six steps:
 1. EXO asks the bridge for a prefill.
 2. The bridge sends the prompt to vLLM with a fresh tag.
 3. The connector writes the request's cache into a free slot and publishes it under the tag, with a versioned header.
-4. The bridge polls the transfer service until the header appears, or until a failure record appears.
+4. The bridge polls the transfer service until the header appears, or until a failure record appears: every 3 ms for the first 2 s (it asks only after vLLM has answered, when the export is tens of milliseconds from published), then every 20 ms, and every 50 ms after 10 s.
 5. The bridge fetches the layers (the next layer prefetched in paged mode, all layers in parallel in DeepSeek mode).
 6. The bridge streams them in EXO's wire format, then releases the export.
 
@@ -164,7 +164,8 @@ Every key that names an address or path has no default. Unknown keys are errors.
 | `timing_log` | false | log one line per export |
 | `stream_layers` | false | paged only: announce each layer in the slot's `stream.log` as soon as it is written, so the bridge can send it while vLLM still prefills (`docs/layerwise.md`); the DeepSeek V4 connector refuses it |
 | `direct_plane_copy` | true | paged only: copy K and V into the slot file as two contiguous copies instead of one copy into the strided `[2, :T]` view, which PyTorch stages through a fresh host buffer per layer when the source is on the GPU. Same bytes. Measured on a DGX Spark: with it, warm-slot prefill is within about 1 s of vLLM without a connector (8k 10.1 s against 9.0 s; 32k 61.8 s against 60.4 s), against 19.0 s and 102.3 s for the strided path. Set `false` for the strided path |
-| `prefault_slot_maps` | true | paged only: before each layer's copy, populate this process's page-table entries for the rows it is about to receive (`madvise(MADV_POPULATE_WRITE)` after `reserve`, Linux 5.14+), once per map and row range. Only the written rows are populated. A refused `madvise` is logged once and never fails an export; the `exported` log line carries `prefault_seconds`. With a `noswap` store it removes the cost of the first export into rows a fresh vLLM process has not written (measured on a DGX Spark at 32k: copy 49.1 s without it, 0.15 s with it, plus 0.3 s of prefault). It cannot help a store that was swapped out |
+| `prefault_slot_maps` | true | paged and dsv4 (for dsv4: each layer file range an export writes; a range `presize_tokens` already covered costs nothing): before each layer's copy, populate this process's page-table entries for the rows it is about to receive (`madvise(MADV_POPULATE_WRITE)` after `reserve`, Linux 5.14+), once per map and row range. Only the written rows are populated. A refused `madvise` is logged once and never fails an export; the `exported` log line carries `prefault_seconds`. With a `noswap` store it removes the cost of the first export into rows a fresh vLLM process has not written (measured on a DGX Spark at 32k: copy 49.1 s without it, 0.15 s with it, plus 0.3 s of prefault). It cannot help a store that was swapped out |
+| `presize_tokens` | 32768 | dsv4 only: at start-up (`register_kv_caches`, TP rank 0) size, allocate and pre-fault every slot's layer files for prompts up to this many tokens, capped at `max_model_len`; 0 turns it off. V4 Flash at 32768: about 245 MB per slot, 3.9 GB for 16 slots, resident from start-up on a `noswap` store (see section 9). Skipped if over half the store's free bytes; logged as `presized`. The paged connector ignores it |
 
 **Selecting requests.** A request is exported when its `kv_transfer_params` carry `{"kvhandoff_tag": "<tag>"}` (or every request, with `export_all`). Any client of vLLM's API can set that key, so see section 8 on protecting the vLLM endpoint.
 
@@ -257,6 +258,10 @@ Each export has one JSON document. It is stored in the slot as `header.json` and
 
 - the store belongs to a system account (`kvhandoff`; the examples use uid/gid 980), or the writer runs as root, which is exempt too;
 - it lives on its own tmpfs (`/srv/kvhandoff`, or a tmpfs Docker volume), not on `/dev/shm`.
+
+**Pre-sized slot files (dsv4).** With `presize_tokens`, the connector sizes, allocates (`posix_fallocate`) and pre-faults (`MADV_POPULATE_WRITE`) every slot's layer files at start-up, so no request pays for fresh tmpfs pages or a remap (measured on a DGX Spark: about 0.2 s at 2k into a fresh slot against 0.017 s into a used one). Sizes come from the converter's own arithmetic (`dsv4_convert.layer_capacity`). Pages a previous vLLM process allocated are reused and not counted again. A longer prompt still grows its files, rounded up to a power of two below 64 MiB. Paged slots are not pre-sized: they hold `max_model_len` rows of every layer, and the paged writer already reserves and pre-faults only the rows each export uses.
+
+**Reader header cache.** `ExportReader` keeps each slot's parsed `header.json`, keyed by the file's device, inode, size, mtime and ctime as read through an open descriptor. The writer only replaces `header.json` by rename (and `begin()` unlinks it), so a reused or republished slot never matches an old entry; every `open()` still takes `LOCK_SH` and checks tag and seq. The transfer service opens the export once per layer request, so a DeepSeek V4 hand-off now parses its 43 kB header once instead of 43 times.
 
 **Slots.** There is a fixed number of slots: paged default `max_num_seqs + 1`, DeepSeek default 16. A slot is reused only when all three hold:
 
@@ -362,7 +367,7 @@ kvhandoff is designed for a prefill host and a decode host that share a private 
 - **Unified memory.** On GB10 this is the same memory the GPU uses, so size the tmpfs (the `size=` option) below what `--gpu-memory-utilization` and the host's other services leave free.
 - **Full store.** When the tmpfs is full, exports fail cleanly (ENOSPC, then a failure record) and the Mac prefills locally.
 
-**dsv4.** Measured at 61 to 66 MB per export at about 7k tokens, and 199 to 209 MB at about 28k. 16 slots of 28k fit in 3.4 GB.
+**dsv4.** Measured at 61 to 66 MB per export at about 7k tokens, and 199 to 209 MB at about 28k. 16 slots of 28k fit in 3.4 GB. `presize_tokens` makes that high-water mark immediate: at the default 32768, 16 V4 Flash slots take about 3.9 GB from start-up. On a `noswap` store those pages are resident, on GB10 in the memory the GPU shares, and `register_kv_caches` runs after vLLM has sized its KV cache, so they come out of what `--gpu-memory-utilization` left for the rest of the host. Lower it (or set 0) where memory is tight.
 
 ## 10. Measured results
 
@@ -428,9 +433,17 @@ The tests run on CPU, with a vLLM stub (`tests/fakes/`) that enforces the real b
 
 | Environment | Result |
 | --- | --- |
-| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 167 passed |
-| the same without `EXO_SRC` | 141 passed, 26 skipped (EXO end-to-end tests) |
-| pytest only, no torch | 85 passed, 7 skipped (6 modules that need torch, as whole modules, and 1 EXO test) |
+| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 196 passed |
+| the same without `EXO_SRC` | 170 passed, 26 skipped (EXO end-to-end tests) |
+| pytest only, no torch | 85 passed, 8 skipped (7 modules that need torch, as whole modules, and 1 EXO test) |
+
+**Short-prompt overhead benchmark** (`python3 bench/short_prompt_overhead_bench.py src`, runs against any tree; x86 CPU, `/dev/shm`, medians). On a CPU a fresh page costs a CPU fault; a GB10's device-to-host copy pays 30 to 60 us per fresh 4 KiB page, so the slot-file gap on a DGX Spark is larger (about 0.2 s at 2k):
+
+| Measure | Before | After |
+| --- | --- | --- |
+| V4 Flash 1882-token export write, fresh slot | 28.6 to 29.8 ms | 8.6 to 8.9 ms presized (23.2 to 24.2 ms fresh) |
+| 43 `ExportReader.open()`, in sequence / 8 threads | 96 / 110 to 113 ms | 5.2 / 17 to 20 ms |
+| header wait overshoot after publish, median (max) | 11 to 15 ms (47 to 60) | 3.6 to 3.9 ms (5.6) |
 
 Set `KVHANDOFF_FORBIDDEN_NAMES="name1,name2"` to have the hygiene test also keep your own host and account names out of `src/`.
 

@@ -33,11 +33,13 @@ PAGE: Final = os.sysconf("SC_PAGE_SIZE")
 
 
 def round_capacity(nbytes: int) -> int:
-    """At least 1 MiB; above 64 MiB rounded up to a 64 MiB multiple, so a slightly longer prompt reuses the map."""
+    """At least 1 MiB; up to 64 MiB rounded up to a power of two, above that to a 64 MiB multiple, so a longer prompt
+    reuses the map. Small files (DeepSeek V4 layers are 0.6 to 10 MB) used to be mapped exactly, so any prompt longer
+    than the first in a slot remapped, re-fallocated and paid fresh page faults again (about 0.3 s at 7k, 3/11)."""
     cap = max(nbytes, _MIB)
     if cap > _ROUND:
-        cap = (cap + _ROUND - 1) // _ROUND * _ROUND
-    return cap
+        return (cap + _ROUND - 1) // _ROUND * _ROUND
+    return 1 << (cap - 1).bit_length()
 
 
 _libc: ctypes.CDLL | None = None
@@ -86,6 +88,15 @@ class SlotMaps:
         m = torch.from_file(path, shared=True, size=cap, dtype=torch.uint8)
         self._maps[(slot, name)] = _Map(gen, m)  # a new map has no page-table entries: populated starts empty
         return m
+
+    def presize(self, slot: int, name: str, nbytes: int, *, prefault: bool = True) -> int:
+        """Size, allocate and (with ``prefault``) populate slot file ``name`` for ``nbytes`` before any export needs it:
+        a map of exactly ``nbytes`` (later exports of up to ``nbytes`` reuse it), ``ExportStore.reserve`` over all of it,
+        then ``prefault`` over all of it. Returns the bytes newly populated. Raises StoreFull if the store cannot hold
+        it (the caller decides whether to go on without)."""
+        self.bytes_map(slot, name, nbytes, exact=True)
+        self.store.reserve(slot, name, 0, nbytes)
+        return self.prefault(slot, name, 0, nbytes) if prefault else 0
 
     def typed_map(self, slot: int, name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         """A tensor of ``shape`` and ``dtype`` over slot file ``name`` (sized exactly; reused while shape stays)."""

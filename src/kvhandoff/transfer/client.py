@@ -57,7 +57,26 @@ class ExportSource(Protocol):
 
 
 def _poll_sleep(attempt: int) -> float:
+    """Back-off for a busy transfer service (503): 5 ms growing to 100 ms."""
     return min(0.1, 0.005 * (1.5**attempt))
+
+
+# wait_header runs after vLLM has answered the prefill request, when the export is a few tens of milliseconds from
+# being published (its own copy), so it polls every HEADER_POLL_FAST seconds for the first HEADER_POLL_FAST_FOR
+# seconds and only then backs off. It used to back off from 5 ms to 100 ms at once, so the poll after the publish
+# came 32 ms late on median and up to 103 ms (measured on hardware). A 404 costs the service about 0.1 to 0.2 ms.
+HEADER_POLL_FAST = 0.003
+HEADER_POLL_FAST_FOR = 2.0
+HEADER_POLL_SLOW = 0.02
+HEADER_POLL_SLOW_AFTER = 10.0
+HEADER_POLL_SLOWEST = 0.05
+
+
+def header_poll_sleep(waited: float) -> float:
+    """Seconds to sleep before the next header poll, after ``waited`` seconds of waiting."""
+    if waited < HEADER_POLL_FAST_FOR:
+        return HEADER_POLL_FAST
+    return HEADER_POLL_SLOW if waited < HEADER_POLL_SLOW_AFTER else HEADER_POLL_SLOWEST
 
 
 def _check_header(h: ExportHeader, tag: str) -> ExportHeader:
@@ -105,7 +124,8 @@ class TransferClient:
             raise HandoffError(f"transfer service {self.base} unreachable: {e}") from e
 
     def wait_header(self, tag: str, deadline: Deadline) -> ExportHeader:
-        attempt = 0
+        t0 = time.monotonic()
+        busy = 0
         while True:
             code, body, _ = self._request("GET", f"/v1/exports/{tag}", deadline.left(10.0))
             if code == 200:
@@ -117,8 +137,12 @@ class TransferClient:
                 raise HandoffError("transfer service refused the token (401)")
             if code not in (404, 503):
                 raise HandoffError(f"transfer service answered {code} for {tag}")
-            time.sleep(min(_poll_sleep(attempt), deadline.left()))
-            attempt += 1
+            if code == 503:  # busy: back off on its own schedule, never at the fast header pace
+                time.sleep(min(_poll_sleep(busy + 6), deadline.left()))
+                busy += 1
+                continue
+            busy = 0
+            time.sleep(min(header_poll_sleep(time.monotonic() - t0), deadline.left()))
 
     def stream_state(self, tag: str, deadline: Deadline) -> StreamState | None:
         code, body, _ = self._request("GET", f"/v1/exports/{tag}/stream", deadline.left(10.0))
@@ -180,15 +204,14 @@ class LocalSource:
         self.reader = ExportReader(root)
 
     def wait_header(self, tag: str, deadline: Deadline) -> ExportHeader:
-        attempt = 0
+        t0 = time.monotonic()
         while True:
             try:
                 return _check_header(self.reader.lookup(tag), tag)
             except ExportFailed as exc:
                 raise HandoffError(str(exc)) from exc
             except ExportNotFound:
-                time.sleep(min(_poll_sleep(attempt), deadline.left()))
-                attempt += 1
+                time.sleep(min(header_poll_sleep(time.monotonic() - t0), deadline.left()))
 
     def stream_state(self, tag: str, deadline: Deadline) -> StreamState | None:
         deadline.left()
