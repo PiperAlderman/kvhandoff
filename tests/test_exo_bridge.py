@@ -25,7 +25,14 @@ import torch
 
 from conftest import free_port, write_token
 from kvhandoff.config import BridgeConfig, TransferConfig
-from kvhandoff.exo.bridge import Bridge, ResultCache, _Result, bf16_to_fp16, token_key  # pyright: ignore[reportPrivateUsage]
+from kvhandoff.exo.bridge import (  # pyright: ignore[reportPrivateUsage]
+    Bridge,
+    ResultCache,
+    _Result,
+    bf16_to_fp16,
+    stream_poll_sleep,
+    token_key,
+)
 from kvhandoff.interchange import KIND_DSV4, KIND_PAGED, ExportHeader, RopeInfo
 from kvhandoff.producer.dsv4_export import DSV4Exporter, DSV4Job, DSV4ModelInfo
 from kvhandoff.producer.paged import PagedExportInfo, PagedWriter, StoreJob
@@ -439,3 +446,12 @@ def test_bridge_refuses_an_export_of_the_wrong_kind(exo_protocol: Any, paged_env
     h = ExportHeader(kind=KIND_DSV4, tag="x", model_id="llama", num_tokens=3)
     with pytest.raises(HandoffError, match="expects paged_kv"):
         br._check(h, KIND_PAGED)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_stream_poll_sleep_never_overflows() -> None:
+    # 1.5 ** attempt overflowed after about 1,750 polls (about 37 s at 20 ms), failing every streamed hand-off whose
+    # first layer came later than that (a streaming bridge over a buffered connector at 27k)
+    assert stream_poll_sleep(0) == pytest.approx(0.002)
+    assert stream_poll_sleep(3) == pytest.approx(0.002 * 1.5**3)
+    for attempt in (6, 50, 1751, 10**6):
+        assert stream_poll_sleep(attempt) == pytest.approx(0.02)

@@ -53,6 +53,18 @@ log = get_logger("exo.bridge")
 _STREAM_POLL_MIN = 0.002
 _STREAM_POLL_MAX = 0.02
 
+
+def stream_poll_sleep(attempt: int) -> float:
+    """Seconds before the next stream poll: _STREAM_POLL_MIN growing by 1.5x per attempt up to _STREAM_POLL_MAX.
+
+    The exponent is capped: ``1.5 ** attempt`` overflows a float (OverflowError, errno 34) after about 1,750 attempts,
+    which at the 20 ms cap is about 37 s of waiting. A streaming bridge in front of a buffered connector waits for the
+    whole prefill before the first layer (48 to 55 s for a 70B prompt at 27k on a GB10), so every such hand-off failed
+    at about 37 s and the decode node prefilled locally.
+    """
+    return min(_STREAM_POLL_MAX, _STREAM_POLL_MIN * (1.5 ** min(attempt, 16)))
+
+
 CONFIG_ENV = "KVHANDOFF_BRIDGE_CONFIG"  # path of the bridge TOML; the hook is active only when it is set
 
 
@@ -325,7 +337,7 @@ class Bridge:
             st = self.source.stream_state(tag, budget)
             if st is not None and ready(st):
                 return st
-            time.sleep(min(_STREAM_POLL_MAX, _STREAM_POLL_MIN * (1.5**attempt), budget.left()))
+            time.sleep(min(stream_poll_sleep(attempt), budget.left()))
             attempt += 1
 
     def _await_layer(self, tag: str, index: int, budget: Deadline, post: Future[float], stop: threading.Event) -> StreamState:
