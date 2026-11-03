@@ -11,7 +11,7 @@ kvhandoff is out-of-tree and has no hard dependencies. It contains:
 - **A transfer service** (`kvhandoff-transfer`) that serves exports over HTTP with a bearer token.
 - **An EXO bridge** that answers EXO's remote-prefill requests by sending the prompt to vLLM and streaming the export back in EXO's wire format, plus a four-line hook for EXO's runner (`kvhandoff-exo-hook`).
 
-Status: tested on CPU (167 tests with torch, numpy and an EXO checkout; see section 12 for what skips without them) and on hardware (one DGX Spark with a Mac Studio for Llama-3.3-70B; four DGX Sparks at TP4 with three Macs for DeepSeek V4 Flash). It is young code with a small user base; see Limitations.
+Status: tested on CPU (197 tests with torch, numpy and an EXO checkout; see section 12 for what skips without them) and on hardware (one DGX Spark with a Mac Studio for Llama-3.3-70B; four DGX Sparks at TP4 with three Macs for DeepSeek V4 Flash). It is young code with a small user base; see Limitations.
 
 ## Contents
 
@@ -334,6 +334,7 @@ kvhandoff must be importable by EXO's interpreter: put it on `PYTHONPATH`, or `u
 **Timeouts.**
 
 - `timeout_s` (default 50 s) covers prefill, export and the first layer. It sits under EXO's 60 s client socket timeout.
+- **Streaming bridge, buffered connector** (`stream_layers` on the bridge only): the first layer exists only once the whole prefill is published, so `timeout_s` must cover the longest prefill. At 27k tokens on Llama-3.3-70B the first layer came 49 to 55 s after the request, beyond the default; our runs used 300 s.
 - **paged:** once streaming has started, each further layer gets its own `timeout_s`. EXO's timeout is per receive, and a 70B 32k stream is about 10.7 GB.
 - **dsv4:** everything happens before the header, so the whole budget applies.
 
@@ -383,7 +384,9 @@ All figures are first-token times through EXO's API on the Mac, one user, unless
 | kvhandoff, streaming at both ends (with EXO's per-layer ingest) | 1.4 to 2.0 s | 8.0 s | 48.7 s |
 
 - The 32k streaming rows are one clean warm run each; the other warm run in each queued behind an aborted cold prefill (55.6 s and 86.2 s). The "both ends" row needs an EXO per-layer ingest change that is not merged yet.
-- **The buffered 32k path is near EXO's limit.** EXO's client allows 60 s per receive, and the Mac's whole buffered 32k transfer took 56.8 to 60.9 s (the bridge sends nothing until vLLM's export is published). A streaming bridge against a buffered connector went over it at 32k and the Mac prefilled locally. Use `stream_layers` on both connector and bridge for long prompts.
+- **The buffered 32k path has about 10 s of headroom under EXO's timeout.** EXO's client allows 60 s per receive, the first one included, and the bridge sends nothing until vLLM's export is published. The first byte reached the Mac 48.6 to 51.4 s after the request (warm, cold, and a vLLM process's first export; the whole transfer took 58 to 61 s), so a prefill about 20 % slower would cross it. [exo-explore/exo#2575](https://github.com/exo-explore/exo/pull/2575) (not merged yet) makes that first wait grow with the prompt. Use `stream_layers` on both connector and bridge for long prompts.
+- **A streaming bridge in front of a buffered connector** completes at 32k since the bridge's poll fix (`stream_poll_sleep`): 3 of 3, first token 60.1 to 65.6 s, with `timeout_s` 300 (section 7) and the Mac on EXO with the open remote-prefill PRs. Before the fix, the bridge's poll back-off overflowed after about 37 s, so every such hand-off failed and the Mac prefilled locally.
+- **Failure drills at 8k** (the Mac on EXO with the open remote-prefill PRs). A full store tmpfs (the connector recorded `StoreFull: store filesystem full`, and vLLM stayed healthy), StoreFull (the only slot held by an unconsumed export) and a link dropped between the Mac and the bridge each ended in a correct answer from a local prefill, and the next request ran with no fallback. The Mac fell back 7.3 to 7.4 s after the request in the two store drills, and about 25 s after it on the dropped link (the TCP keepalive of exo-explore/exo#2575; stock EXO waits for its 60 s receive timeout). A vLLM frozen for 62 s mid-prefill completed remotely with #2575 (first token 71.4 s).
 - **Cold store (a fresh vLLM process, store already populated), with `noswap` and `prefault_slot_maps`:** the buffered cold 32k export took 50.0 s against 47.5 s warm, with a first token of 62.1 s and no fallback; cold 8k was 10.9 s buffered and 9.0 s streamed. The streamed cold 32k hand-off completed in 79.9 s, about 30 s slower than warm (not yet explained), and needed an EXO change that reports progress per received layer ([exo-explore/exo#2553](https://github.com/exo-explore/exo/pull/2553), not merged yet) so EXO's 90 s runner-stall check does not fire.
 - **Chunked prefill** (`--max-num-batched-tokens 8192`) with streaming at both ends: warm 32k first token 47.6 to 47.8 s.
 - Answer quality was 9/9 on a fixed check set in every configuration, with no local fallbacks and no failed exports.
@@ -433,8 +436,8 @@ The tests run on CPU, with a vLLM stub (`tests/fakes/`) that enforces the real b
 
 | Environment | Result |
 | --- | --- |
-| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 196 passed |
-| the same without `EXO_SRC` | 170 passed, 26 skipped (EXO end-to-end tests) |
+| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 197 passed |
+| the same without `EXO_SRC` | 171 passed, 26 skipped (EXO end-to-end tests) |
 | pytest only, no torch | 85 passed, 8 skipped (7 modules that need torch, as whole modules, and 1 EXO test) |
 
 **Short-prompt overhead benchmark** (`python3 bench/short_prompt_overhead_bench.py src`, runs against any tree; x86 CPU, `/dev/shm`, medians). On a CPU a fresh page costs a CPU fault; a GB10's device-to-host copy pays 30 to 60 us per fresh 4 KiB page, so the slot-file gap on a DGX Spark is larger (about 0.2 s at 2k):
@@ -450,7 +453,7 @@ Set `KVHANDOFF_FORBIDDEN_NAMES="name1,name2"` to have the hygiene test also keep
 ## 13. Limitations
 
 - **Store on a swappable tmpfs.** Without `noswap` (Linux 6.4+), a store swapped out between vLLM processes makes the next export slow (a cold 32k export took 99.6 s against 47.5 s warm). A buffered 32k hand-off then exceeds EXO's 60 s per-receive timeout and the Mac prefills locally; a streamed one can trip EXO's 90 s runner-stall check, which stock EXO answers with an empty reply.
-- **Long buffered hand-offs.** Even warm, a buffered 32k hand-off of a 70B model sits close to EXO's 60 s per-receive timeout (section 10). Prefer `stream_layers` at that length.
+- **Long buffered hand-offs.** A buffered 32k hand-off of a 70B model gets its first byte to the Mac 48.6 to 51.4 s after the request, about 10 s inside stock EXO's 60 s per-receive timeout (section 10); a slower prefill crosses it. Prefer `stream_layers` at that length.
 - **Cold streamed hand-offs** are about 30 s slower than warm at 32k, even with `noswap` and `prefault_slot_maps`. They complete only with an EXO client that reports progress per received layer ([exo-explore/exo#2553](https://github.com/exo-explore/exo/pull/2553), not merged yet).
 - **Producer only.** The consumer is EXO. kvhandoff does not hand caches to another vLLM.
 - **Narrow model and layout coverage.** The paged connector refuses MLA and other layouts; DeepSeek V4 has its own converter. Each connector was hardware-tested with one vLLM build. The paged connector's tensor-parallel gather is tested on CPU only.
@@ -458,7 +461,7 @@ Set `KVHANDOFF_FORBIDDEN_NAMES="name1,name2"` to have the hygiene test also keep
 - **EXO coupling.** The hook inserts four lines into EXO's runner, and the bridge needs a placeholder EXO prefill instance on the host that carries it. Both track EXO internals.
 - **Linux only** on the producer side (`flock`, `posix_fallocate`, `madvise`, tmpfs).
 - **No TLS and no dual-token rotation** (section 8). Without a vLLM API key, any vLLM client can tag requests and fill the store's slots (section 8).
-- **Layer-by-layer streaming is off by default.** It has been measured warm at three prompt sizes; failure drills under load and chunked-prefill runs are still to do.
+- **Layer-by-layer streaming is off by default.** It has been measured warm at three prompt sizes, cold, and with chunked prefill; failure drills with streaming at both ends and under concurrent load are still to do.
 
 ## 14. Licence
 
