@@ -11,7 +11,7 @@ kvhandoff is out-of-tree and has no hard dependencies. It contains:
 - **A transfer service** (`kvhandoff-transfer`) that serves exports over HTTP with a bearer token.
 - **An EXO bridge** that answers EXO's remote-prefill requests by sending the prompt to vLLM and streaming the export back in EXO's wire format, plus a four-line hook for EXO's runner (`kvhandoff-exo-hook`).
 
-Status: tested on CPU (219 tests with torch, numpy and an EXO checkout; see section 12 for what skips without them) and on hardware (one DGX Spark with a Mac Studio for Llama-3.3-70B; four DGX Sparks at TP4 with three Macs for DeepSeek V4 Flash). It is young code with a small user base; see Limitations.
+Status: tested on CPU (222 tests with torch, numpy and an EXO checkout; see section 12 for what skips without them) and on hardware (one DGX Spark with a Mac Studio for Llama-3.3-70B; four DGX Sparks at TP4 with three Macs for DeepSeek V4 Flash). It is young code with a small user base; see Limitations.
 
 ## Contents
 
@@ -161,7 +161,7 @@ Every key that names an address or path has no default. Unknown keys are errors.
 | `rerope` | `ratio0` | dsv4 only: re-rotate ratio-0 layers to MLX's RoPE, or `none` |
 | `rope_check_layers` | 3 | dsv4 only: layers whose RoPE distance to MLX is recorded in `extra` |
 | `allow_login_uid_store` | false | accept a `/dev/shm` store owned by a login uid (RemoveIPC risk) |
-| `timing_log` | false | log one line per export |
+| `timing_log` | false | log one line per export (`exported`: reserve, prefault, copy, stream and gather seconds) and one per-layer timing line (`export_layers`: each layer's enter and exit offsets from the export's start, the connector's gather time and each writer stage, in milliseconds, so time spent between layers shows) |
 | `stream_layers` | false | paged only: announce each layer in the slot's `stream.log` as soon as it is written, so the bridge can send it while vLLM still prefills (`docs/layerwise.md`); the DeepSeek V4 connector refuses it |
 | `direct_plane_copy` | true | paged only: copy K and V into the slot file as two contiguous copies instead of one copy into the strided `[2, :T]` view, which PyTorch stages through a fresh host buffer per layer when the source is on the GPU. Same bytes. Measured on a DGX Spark: with it, warm-slot prefill is within about 1 s of vLLM without a connector (8k 10.1 s against 9.0 s; 32k 61.8 s against 60.4 s), against 19.0 s and 102.3 s for the strided path. Set `false` for the strided path |
 | `prefault_slot_maps` | true | paged and dsv4 (for dsv4: each layer file range an export writes; a range `presize_tokens` already covered costs nothing): before each layer's copy, populate this process's page-table entries for the rows it is about to receive (`madvise(MADV_POPULATE_WRITE)` after `reserve`, Linux 5.14+), once per map and row range. Only the written rows are populated. A refused `madvise` is logged once and never fails an export; the `exported` log line carries `prefault_seconds`. With a `noswap` store it removes the cost of the first export into rows a fresh vLLM process has not written (measured on a DGX Spark at 32k: copy 49.1 s without it, 0.15 s with it, plus 0.3 s of prefault). It cannot help a store that was swapped out |
@@ -441,8 +441,8 @@ The tests run on CPU, with a vLLM stub (`tests/fakes/`) that enforces the real b
 
 | Environment | Result |
 | --- | --- |
-| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 219 passed |
-| the same without `EXO_SRC` | 187 passed, 32 skipped (EXO end-to-end tests) |
+| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 222 passed |
+| the same without `EXO_SRC` | 190 passed, 32 skipped (EXO end-to-end tests) |
 | pytest only, no torch | 101 passed, 8 skipped (7 modules that need torch, as whole modules, and 1 EXO test) |
 
 **Short-prompt overhead benchmark** (`python3 bench/short_prompt_overhead_bench.py src`, runs against any tree; x86 CPU, `/dev/shm`, medians). On a CPU a fresh page costs a CPU fault; a GB10's device-to-host copy pays 30 to 60 us per fresh 4 KiB page, so the slot-file gap on a DGX Spark is larger (about 0.2 s at 2k):

@@ -171,6 +171,9 @@ class _Pending:
     copy_s: float = 0.0  # timing log: time in the device-to-host copies (host-synchronous for a pageable map)
     swap0: tuple[int, int] = (-1, -1)  # timing log: (pswpin, pswpout) when the export began
     prefault_s: float = 0.0  # time spent populating slot map pages for this export
+    stream_s: float = 0.0  # timing log: device fence plus stream-log append (stream_layers only)
+    gather_s: float = 0.0  # timing log: connector gather/normalise before write_layer (waits for the layer's compute)
+    layer_times: list[list[float | int | None]] = field(default_factory=list[list[float | int | None]])  # LAYER_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -180,6 +183,26 @@ class PagedExportInfo:
     max_tokens: int  # rows each layer file is sized for (max_model_len + margin)
     rope: RopeInfo
     producer: dict[str, Any]
+
+
+# Per-layer timing (timing_log): one row per layer in the `export_layers` event, milliseconds. `enter` and `exit` are
+# offsets from the export's start (its first write_layer), so `enter[i] - exit[i-1]` is the time outside the writer
+# between two layers (the model's compute plus the connector's gather), and `gather` is the part of it the caller
+# measured from save_kv_layer's entry (it waits for the layer's compute: the gather's index copy synchronises).
+LAYER_COLUMNS: tuple[str, ...] = (
+    "layer",
+    "enter_ms",
+    "gather_ms",
+    "reserve_ms",
+    "prefault_ms",
+    "copy_ms",
+    "stream_ms",
+    "exit_ms",
+)
+
+
+def _ms(seconds: float) -> float:
+    return round(seconds * 1000.0, 3)
 
 
 def _device_fence(t: torch.Tensor) -> None:
@@ -279,11 +302,16 @@ class PagedWriter:
         if p is not None:
             self._set_failed(p, error)
 
-    def write_layer(self, job: StoreJob, layer_index: int, layer_name: str, kv_split: torch.Tensor) -> None:
-        """kv_split: [2, T, H, D] for this job (after any TP gather and dtype cast)."""
+    def write_layer(
+        self, job: StoreJob, layer_index: int, layer_name: str, kv_split: torch.Tensor, *, entered: float | None = None
+    ) -> None:
+        """kv_split: [2, T, H, D] for this job (after any TP gather and dtype cast). ``entered``: perf_counter() when
+        the caller began this layer (save_kv_layer's entry), for the timing log's gather column."""
+        t_w = time.perf_counter()
         p = self._pending_for(job)
         if p is None or p.failed:
             return
+        rs = pf = cp = sl = 0.0
         try:
             if self.stream_layers and layer_index in p.layers:  # a reader may already have sent the first copy
                 raise ValueError(f"layer {layer_index} written twice in one streamed export")
@@ -304,12 +332,14 @@ class PagedWriter:
             t_rs = time.perf_counter()
             self.store.reserve(p.slot, fname, 0, t * row)  # K rows, then V rows: never SIGBUS on a full tmpfs
             self.store.reserve(p.slot, fname, cap * row, t * row)
-            p.reserve_s += time.perf_counter() - t_rs
+            rs = time.perf_counter() - t_rs
+            p.reserve_s += rs
             if self.prefault_slot_maps:  # after reserve: the pages exist, so populating them never allocates or fails
                 t_pf = time.perf_counter()
                 self.maps.prefault(p.slot, fname, 0, t * row)
                 self.maps.prefault(p.slot, fname, cap * row, t * row)
-                p.prefault_s += time.perf_counter() - t_pf
+                pf = time.perf_counter() - t_pf
+                p.prefault_s += pf
             t_cp = time.perf_counter()
             if self.direct_plane_copy:
                 # K rows and V rows are each one contiguous run of the file, so each copy_ is a single same-dtype
@@ -321,14 +351,34 @@ class PagedWriter:
                 # CUDA source PyTorch stages that through a fresh host buffer of the whole view, then copies it in
                 # again on the CPU: the cause of a measured 1.5x slower prefill.
                 dst[:, :t].copy_(kv_split)  # GPU -> shared host map (same physical memory on GB10)
-            p.copy_s += time.perf_counter() - t_cp
+            cp = time.perf_counter() - t_cp
+            p.copy_s += cp
             ref = paged_layer(layer_index, layer_name, num_tokens=t, heads=h, head_dim=d, dtype=wire, row_capacity=cap)
             if self.stream_layers:
+                t_sl = time.perf_counter()
                 _device_fence(kv_split)  # the bytes are complete before the stream-log line that announces them
                 self.store.stream_layer(p.slot, ref)
+                sl = time.perf_counter() - t_sl
+                p.stream_s += sl
             p.layers[layer_index] = ref
         except (ValueError, StoreError, OSError, RuntimeError) as exc:
             self._set_failed(p, f"{type(exc).__name__}: {exc}")
+        if self.timing_log:
+            g = t_w - entered if entered is not None else None
+            if g is not None:
+                p.gather_s += g
+            p.layer_times.append(
+                [
+                    layer_index,
+                    _ms(max(0.0, t_w - p.t0)),
+                    None if g is None else _ms(g),
+                    _ms(rs),
+                    _ms(pf),
+                    _ms(cp),
+                    _ms(sl),
+                    _ms(time.perf_counter() - p.t0),
+                ]
+            )
 
     def finish_step(self) -> list[ExportHeader]:
         """Publish everything written this step (call after the device is synchronised)."""
@@ -361,8 +411,18 @@ class PagedWriter:
                     prefault_seconds=round(p.prefault_s, 4),
                     reserve_seconds=round(p.reserve_s, 4),
                     copy_seconds=round(p.copy_s, 4),
+                    stream_seconds=round(p.stream_s, 4),
+                    gather_seconds=round(p.gather_s, 4),
                     pswpin=swap1[0] - p.swap0[0] if min(swap1[0], p.swap0[0]) >= 0 else None,
                     pswpout=swap1[1] - p.swap0[1] if min(swap1[1], p.swap0[1]) >= 0 else None,
+                )
+                log.info(
+                    "export_layers",
+                    tag=tag,
+                    slot=p.slot,
+                    tokens=p.job.num_tokens,
+                    columns=list(LAYER_COLUMNS),
+                    rows=p.layer_times,
                 )
         self._pending.clear()
         self._dead.clear()

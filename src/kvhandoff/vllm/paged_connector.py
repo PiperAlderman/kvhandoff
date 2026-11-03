@@ -17,6 +17,7 @@ job in the same order (so the collectives pair up), and rank 0 writes.
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 import torch
@@ -161,6 +162,7 @@ class KVHandoffPagedConnector(KVConnectorBase_V1, SupportsHMA):
         rank0 = tp is None or not multi or tp.rank_in_group == 0
         out_dtype = getattr(torch, self._cfg.out_dtype) if self._cfg.out_dtype else None
         for job in meta.requests:  # the same order on every rank, so the all-gathers pair up
+            entered = time.perf_counter()
             slots = self._slot_cache.get(job.tag)
             if slots is None:
                 slots = self._slot_cache[job.tag] = slot_mapping(job.block_ids, job.num_tokens, self._block_size)
@@ -177,7 +179,7 @@ class KVHandoffPagedConnector(KVConnectorBase_V1, SupportsHMA):
             if multi and tp is not None:
                 kv = tp.all_gather(kv.contiguous(), dim=2)  # [2, T, H_total, D]
             if rank0:
-                self._writer_for_rank0().write_layer(job, idx, layer_name, kv)
+                self._writer_for_rank0().write_layer(job, idx, layer_name, kv, entered=entered)
 
     def wait_for_save(self) -> None:
         self._slot_cache.clear()

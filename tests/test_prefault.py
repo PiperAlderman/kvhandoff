@@ -189,3 +189,46 @@ def test_timing_log_carries_stage_seconds_and_swap_deltas(tmp_path: Any, caplog:
         assert fields[key] >= 0
     assert fields["pswpin"] is None or fields["pswpin"] >= 0
     assert "pswpout" in fields
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_timing_log_has_one_row_per_layer(tmp_path: Any, caplog: pytest.LogCaptureFixture, stream: bool) -> None:
+    """A slow streamed export can show reserve, prefault and copy all small, with the time between the writer's
+    stages. export_layers carries one row per layer (enter and exit offsets, the caller's gather time, each stage),
+    so the gaps between layers and the stream-log appends show."""
+    import logging
+    import time
+
+    from kvhandoff.producer.paged import LAYER_COLUMNS
+
+    w = PagedWriter(ExportStore(str(tmp_path / "s"), slots=1, hold_seconds=0), info(64), timing_log=True, stream_layers=stream)
+    kv = torch.randn(2, 40, H, D).to(torch.float16)
+    job = StoreJob(req_id="r", tag="p-l", num_tokens=40, block_ids=[1])
+    with caplog.at_level(logging.INFO, logger="kvhandoff"):
+        for i in range(3):
+            entered = time.perf_counter()
+            time.sleep(0.002)
+            w.write_layer(job, i, f"model.layers.{i}.self_attn.attn", kv, entered=entered if i else None)
+        assert len(w.finish_step()) == 1
+    (ex,) = [r.fields for r in caplog.records if r.getMessage() == "exported"]  # type: ignore[attr-defined]
+    (lt,) = [r.fields for r in caplog.records if r.getMessage() == "export_layers"]  # type: ignore[attr-defined]
+    assert lt["columns"] == list(LAYER_COLUMNS) and lt["tag"] == "p-l" and lt["tokens"] == 40
+    rows = [dict(zip(LAYER_COLUMNS, r, strict=True)) for r in lt["rows"]]
+    assert [r["layer"] for r in rows] == [0, 1, 2]
+    assert rows[0]["gather_ms"] is None and all(r["gather_ms"] >= 2.0 for r in rows[1:])
+    assert all(r["exit_ms"] >= r["enter_ms"] >= 0 for r in rows)
+    assert all(rows[i + 1]["enter_ms"] >= rows[i]["exit_ms"] for i in range(2))
+    assert all((r["stream_ms"] > 0) == stream for r in rows)
+    assert ex["gather_seconds"] >= 0.004 and (ex["stream_seconds"] > 0) == stream
+
+
+def test_timing_log_off_keeps_no_rows(tmp_path: Any, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    w = PagedWriter(ExportStore(str(tmp_path / "s"), slots=1, hold_seconds=0), info(64))
+    kv = torch.randn(2, 40, H, D).to(torch.float16)
+    job = StoreJob(req_id="r", tag="p-o", num_tokens=40, block_ids=[1])
+    with caplog.at_level(logging.INFO, logger="kvhandoff"):
+        w.write_layer(job, 0, "model.layers.0.self_attn.attn", kv, entered=0.0)
+        assert len(w.finish_step()) == 1
+    assert not [r for r in caplog.records if r.getMessage() in ("exported", "export_layers")]
