@@ -404,6 +404,32 @@ def test_a_writer_that_stalls_past_the_layer_timeout_fails_without_done(exo_prot
     assert isinstance(msgs[-1], proto.ErrorMessage) and not any(isinstance(m, proto.Done) for m in msgs)
 
 
+@pytest.mark.parametrize(
+    "per_1k, start, completes",
+    [(50.0, 0, True), (0.0, 0, False), (50.0, 30, False)],
+    ids=["scaled", "fixed", "start_pos"],
+)
+def test_the_pre_header_budget_scales_with_the_tokens_to_prefill(
+    exo_protocol: Any, gated: Any, per_1k: float, start: int, completes: bool
+) -> None:
+    """A prefill slower than timeout_s completes when the budget scaled by the tokens to prefill covers it (1 s + 40
+    tokens at 50 s per 1000 = 3 s against 2 s), and fails without it, or when start_pos leaves only 10 tokens (1.5 s)."""
+    v, source = gated
+    v.gate = lambda i: time.sleep(2.0) if i == 0 else None
+    out = Recorder()
+    br = bridge(v, source, pad_tokens=0, timeout_s=1, timeout_per_1k_tokens_s=per_1k)
+    r = req(list(range(40)), f"budget-{per_1k}-{start}", start=start)
+    if completes:
+        br.resolve(r, out)
+        assert isinstance(decode(exo_protocol, out.getvalue())[1][-1], exo_protocol.Done)
+    else:
+        with pytest.raises(HandoffError, match="budget"):
+            br.resolve(r, out)
+        assert out.getvalue() == b""  # failed before EXO's stream was written to
+    time.sleep(1.2)  # let the gated forward finish before the store is torn down
+    br.close()
+
+
 @pytest.mark.parametrize("how", ["post", "record"])
 def test_abort_mid_prefill_fails_fast_without_done(exo_protocol: Any, gated: Any, how: str) -> None:
     """After two layers either vLLM's request fails (engine died, request aborted: no publish, no failure line, the

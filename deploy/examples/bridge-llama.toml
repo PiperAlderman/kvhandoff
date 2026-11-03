@@ -7,7 +7,9 @@ transfer_url = "http://127.0.0.1:8094"                 # or local_store_path = "
 transfer_token_file = "/etc/kvhandoff/pair-b.token"   # the pair's token, 0640 root:kvhandoff; EXO's user is in group kvhandoff
 allow_group_readable_token = true
 vllm_api_key_file = "/etc/kvhandoff/pair-b.vllm.key"   # the API key of the vLLM launched with the connector (VLLM_API_KEY env-file)
-timeout_s = 50                 # prefill + export + first layer; each later layer gets its own timeout_s
+timeout_s = 50                 # first-byte budget base; each later layer gets its own timeout_s
+timeout_per_1k_tokens_s = 4    # + 4 s per 1000 tokens to prefill (EXO with exo#2575 waits 60 + 4 per 1000)
+timeout_max_s = 600            # cap on the scaled first-byte budget; 55 for stock EXO (flat 60 s)
 block_size = 16                # vLLM --block-size; pad_tokens defaults to block_size + 1 (as hardware-tested)
 wire_dtype = "float16"         # what the MLX model expects (Llama 4-bit MLX: fp16)
 expect_model_id = "llama70b"

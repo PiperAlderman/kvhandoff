@@ -11,7 +11,7 @@ kvhandoff is out-of-tree and has no hard dependencies. It contains:
 - **A transfer service** (`kvhandoff-transfer`) that serves exports over HTTP with a bearer token.
 - **An EXO bridge** that answers EXO's remote-prefill requests by sending the prompt to vLLM and streaming the export back in EXO's wire format, plus a four-line hook for EXO's runner (`kvhandoff-exo-hook`).
 
-Status: tested on CPU (197 tests with torch, numpy and an EXO checkout; see section 12 for what skips without them) and on hardware (one DGX Spark with a Mac Studio for Llama-3.3-70B; four DGX Sparks at TP4 with three Macs for DeepSeek V4 Flash). It is young code with a small user base; see Limitations.
+Status: tested on CPU (219 tests with torch, numpy and an EXO checkout; see section 12 for what skips without them) and on hardware (one DGX Spark with a Mac Studio for Llama-3.3-70B; four DGX Sparks at TP4 with three Macs for DeepSeek V4 Flash). It is young code with a small user base; see Limitations.
 
 ## Contents
 
@@ -192,7 +192,9 @@ Every key that names an address or path has no default. Unknown keys are errors.
 | `vllm_api_key_file` | none | vLLM's API key, sent as a bearer (give vLLM the same key with `VLLM_API_KEY` from an env-file, never `--api-key` on argv) |
 | `transfer_url` + `transfer_token_file` | one source required | fetch over HTTP |
 | `local_store_path` | (the other source) | paged mode only, same host, needs the store's group |
-| `timeout_s` | 50 | |
+| `timeout_s` | 50 | base budget before the first byte, and each later layer's budget (section 7, Timeouts); alone in a config, a fixed budget |
+| `timeout_per_1k_tokens_s` | 4 | added to the first-byte budget per 1000 tokens to prefill (0 when only `timeout_s` is set) |
+| `timeout_max_s` | 600 | cap on the first-byte budget; must be >= `timeout_s` (default: the larger of 600 and `timeout_s`); 55 against stock EXO |
 | `max_inflight` | 4 | |
 | `queue_wait_s` | 5 | |
 | `fetch_threads` | 8 | |
@@ -333,10 +335,13 @@ kvhandoff must be importable by EXO's interpreter: put it on `PYTHONPATH`, or `u
 
 **Timeouts.**
 
-- `timeout_s` (default 50 s) covers prefill, export and the first layer. It sits under EXO's 60 s client socket timeout.
-- **Long prompts need a larger `timeout_s`.** In buffered mode, and with a streaming bridge in front of a buffered connector (`stream_layers` on the bridge only), nothing can be sent until the whole prefill is published, so `timeout_s` must cover the longest prefill and export. For Llama-3.3-70B at 27k tokens on a DGX Spark, a warm export published 48 to 50 s after the request and a fresh vLLM process's first export 50 to 51 s, and with a streaming bridge over a buffered connector the first layer came at 49 to 55 s: the default 50 s leaves no margin at that length, and the bridge, not EXO, is then the tighter limit. The cold-store, streaming-bridge and drill runs in section 10 used 300 s. Past about 60 s before the first byte, EXO also needs to wait longer ([exo-explore/exo#2575](https://github.com/exo-explore/exo/pull/2575)); `stream_layers` at both ends avoids both limits.
+- **Before the first byte** (vLLM's queue and prefill, the export, fetching the first layer), the budget scales with the tokens to prefill, `len(token_ids) - start_pos`, the count EXO uses: `min(timeout_max_s, timeout_s + timeout_per_1k_tokens_s * tokens / 1000)`. The defaults (50 s, 4 s per 1000 tokens, cap 600 s) give 58 s at 2k, 82 s at 8k, 158 s at 27k and 178 s at 32k.
+- **Why those numbers.** EXO's client with [exo-explore/exo#2575](https://github.com/exo-explore/exo/pull/2575) (not merged yet) waits `EXO_REMOTE_PREFILL_WAIT_SECONDS` (60) plus `EXO_REMOTE_PREFILL_WAIT_SECONDS_PER_1K_TOKENS` (4) per 1000 tokens for the first layer. The bridge's defaults stay 10 s inside that at every length up to the cap, as a fixed 50 s did against EXO's flat 60 s, so a slow prefill fails at the bridge first and the Mac prefills locally at once. If EXO's two variables are raised, raise `timeout_s` and `timeout_per_1k_tokens_s` to match.
+- **Stock EXO** waits a flat 60 s for the first byte. Set `timeout_max_s = 55` there: the budget stays 5 s inside EXO at every length, and the bridge does not keep a vLLM prefill and an in-flight place long after EXO has given up. Do not set `timeout_per_1k_tokens_s = 0` with the 50 s base for this: a warm 27k export's first byte comes at 48.6 to 51.4 s, so a fixed 50 s cuts hand-offs EXO would have accepted. With stock EXO, a buffered prefill longer than about 60 s falls back however the bridge is set; `stream_layers` at both ends avoids that limit.
+- **Older configs.** A config that sets `timeout_s` and neither new key keeps `timeout_s` as a fixed budget, as before. Setting either new key makes `timeout_s` the base.
+- **Measured need.** For Llama-3.3-70B at 27k tokens on a DGX Spark, a warm export published 48 to 50 s after the request and a fresh vLLM process's first export 50 to 51 s, and with a streaming bridge over a buffered connector the first layer came at 49 to 55 s: a fixed 50 s left no margin at that length. The cold-store, streaming-bridge and drill runs in section 10 predate the scaled budget and used a fixed `timeout_s` of 300 s.
 - **paged:** once streaming has started, each further layer gets its own `timeout_s`. EXO's timeout is per receive, and a 70B 32k stream is about 10.7 GB.
-- **dsv4:** everything happens before the header, so the whole budget applies.
+- **dsv4:** everything happens before the header, so the whole scaled budget applies.
 
 **Failures.**
 
@@ -384,7 +389,7 @@ All figures are first-token times through EXO's API on the Mac, one user, unless
 | kvhandoff, streaming at both ends (with EXO's per-layer ingest) | 1.4 to 2.0 s | 8.0 s | 48.7 s |
 
 - The 32k streaming rows are one clean warm run each; the other warm run in each queued behind an aborted cold prefill (55.6 s and 86.2 s). The "both ends" row needs an EXO per-layer ingest change that is not merged yet.
-- **The buffered 32k path has about 10 s of headroom under EXO's timeout.** EXO's client allows 60 s per receive, the first one included, and the bridge sends nothing until vLLM's export is published. The first byte reached the Mac 48.6 to 51.4 s after the request (warm, cold, and a vLLM process's first export; the whole transfer took 58 to 61 s), so a prefill about 20 % slower would cross it. The bridge's default `timeout_s` (50 s) is tighter still at this length (section 7). [exo-explore/exo#2575](https://github.com/exo-explore/exo/pull/2575) (not merged yet) makes that first wait grow with the prompt. Use `stream_layers` on both connector and bridge for long prompts.
+- **The buffered 32k path has about 10 s of headroom under EXO's timeout.** EXO's client allows 60 s per receive, the first one included, and the bridge sends nothing until vLLM's export is published. The first byte reached the Mac 48.6 to 51.4 s after the request (warm, cold, and a vLLM process's first export; the whole transfer took 58 to 61 s), so a prefill about 20 % slower would cross it. A fixed bridge `timeout_s` of 50 s was tighter still at this length; the bridge's first-byte budget now scales with the prompt (section 7). [exo-explore/exo#2575](https://github.com/exo-explore/exo/pull/2575) (not merged yet) makes that first wait grow with the prompt. Use `stream_layers` on both connector and bridge for long prompts.
 - **A streaming bridge in front of a buffered connector** completes at 32k since the bridge's poll fix (`stream_poll_sleep`): 3 of 3, first token 60.1 to 65.6 s, with `timeout_s` 300 (section 7) and the Mac on EXO with the open remote-prefill PRs. Before the fix, the bridge's poll back-off overflowed after about 37 s, so every such hand-off failed and the Mac prefilled locally.
 - **Failure drills at 8k** (the Mac on EXO with the open remote-prefill PRs, bridge `timeout_s` 300). A full store tmpfs (the connector recorded `StoreFull: store filesystem full`, and vLLM stayed healthy), StoreFull (the only slot held by an unconsumed export) and a link dropped between the Mac and the bridge each ended in a correct answer from a local prefill, and the next request ran with no fallback. The Mac fell back 7.3 to 7.4 s after the request in the two store drills, and about 25 s after it on the dropped link (the TCP keepalive of exo-explore/exo#2575; stock EXO waits for its 60 s receive timeout). A vLLM frozen for 62 s mid-prefill completed remotely with exo-explore/exo#2575 (first token 71.4 s).
 - **Cold store (a fresh vLLM process, store already populated), with `noswap` and `prefault_slot_maps`:** the buffered cold 32k export took 50.0 s against 47.5 s warm, with a first token of 62.1 s and no fallback; cold 8k was 10.9 s buffered and 9.0 s streamed. The streamed cold 32k hand-off completed in 79.9 s, about 30 s slower than warm (not yet explained), and needed an EXO change that reports progress per received layer ([exo-explore/exo#2553](https://github.com/exo-explore/exo/pull/2553), not merged yet) so EXO's 90 s runner-stall check does not fire.
@@ -436,9 +441,9 @@ The tests run on CPU, with a vLLM stub (`tests/fakes/`) that enforces the real b
 
 | Environment | Result |
 | --- | --- |
-| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 197 passed |
-| the same without `EXO_SRC` | 171 passed, 26 skipped (EXO end-to-end tests) |
-| pytest only, no torch | 85 passed, 8 skipped (7 modules that need torch, as whole modules, and 1 EXO test) |
+| torch, numpy, msgspec, `EXO_SRC` set to an EXO checkout at 871caad4 | 219 passed |
+| the same without `EXO_SRC` | 187 passed, 32 skipped (EXO end-to-end tests) |
+| pytest only, no torch | 101 passed, 8 skipped (7 modules that need torch, as whole modules, and 1 EXO test) |
 
 **Short-prompt overhead benchmark** (`python3 bench/short_prompt_overhead_bench.py src`, runs against any tree; x86 CPU, `/dev/shm`, medians). On a CPU a fresh page costs a CPU fault; a GB10's device-to-host copy pays 30 to 60 us per fresh 4 KiB page, so the slot-file gap on a DGX Spark is larger (about 0.2 s at 2k):
 
@@ -453,7 +458,7 @@ Set `KVHANDOFF_FORBIDDEN_NAMES="name1,name2"` to have the hygiene test also keep
 ## 13. Limitations
 
 - **Store on a swappable tmpfs.** Without `noswap` (Linux 6.4+), a store swapped out between vLLM processes makes the next export slow (a cold 32k export took 99.6 s against 47.5 s warm). A buffered 32k hand-off then exceeds EXO's 60 s per-receive timeout and the Mac prefills locally; a streamed one can trip EXO's 90 s runner-stall check, which stock EXO answers with an empty reply.
-- **Long buffered hand-offs.** A buffered 32k hand-off of a 70B model gets its first byte to the Mac 48.6 to 51.4 s after the request, about 10 s inside stock EXO's 60 s per-receive timeout (section 10), and the bridge's default `timeout_s` of 50 s leaves no margin at all (section 7); a slower prefill crosses them. Prefer `stream_layers` at that length.
+- **Long buffered hand-offs.** A buffered 32k hand-off of a 70B model gets its first byte to the Mac 48.6 to 51.4 s after the request, about 10 s inside stock EXO's 60 s per-receive timeout (section 10); a slower prefill crosses it. The bridge's own first-byte budget scales with the prompt (section 7), so it is not the tighter limit with its defaults. Prefer `stream_layers` at that length.
 - **Cold streamed hand-offs** are about 30 s slower than warm at 32k, even with `noswap` and `prefault_slot_maps`. They complete only with an EXO client that reports progress per received layer ([exo-explore/exo#2553](https://github.com/exo-explore/exo/pull/2553), not merged yet).
 - **Producer only.** The consumer is EXO. kvhandoff does not hand caches to another vLLM.
 - **Narrow model and layout coverage.** The paged connector refuses MLA and other layouts; DeepSeek V4 has its own converter. Each connector was hardware-tested with one vLLM build. The paged connector's tensor-parallel gather is tested on CPU only.

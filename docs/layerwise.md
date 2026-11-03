@@ -115,8 +115,8 @@ Bytes on the wire to EXO are identical to the buffered bridge's for the same exp
 
 **Timeouts.**
 
-- `timeout_s` (default 50 s) still covers the pre-header phase: vLLM's queue and prefill up to layer 0, and fetching layer 0.
-- vLLM's POST keeps the same whole-prefill deadline it has today, so streaming adds no new limit.
+- The pre-header phase (vLLM's queue and prefill up to layer 0, and fetching layer 0) gets the scaled budget, `min(timeout_max_s, timeout_s + timeout_per_1k_tokens_s * tokens / 1000)` (README section 7, Timeouts), as the buffered path does.
+- vLLM's POST keeps the same whole-prefill deadline as the buffered path (the scaled budget), so streaming adds no new limit.
 - After the Header, each further layer gets its own `timeout_s`, as the buffered path does for fetches.
 - The gap between KVChunks is about one layer of compute (0.5 s at 32k), far below EXO's 60 s per-receive socket timeout.
 - The final wait for publish gets its own `timeout_s`.

@@ -258,7 +258,7 @@ class Bridge:
         n, start = len(tokens), int(request.start_pos)
         if n == 0 or not 0 <= start < n:
             raise HandoffError(f"bad request: {n} tokens, start_pos {start}")
-        deadline = Deadline(self.cfg.timeout_s)
+        deadline = Deadline(self.cfg.prefill_timeout_s(n - start))  # scales with the prompt, as EXO's first-layer wait
         padded = tokens + [tokens[-1]] * self.cfg.effective_pad_tokens
         self._slot(deadline)
         try:
@@ -367,7 +367,7 @@ class Bridge:
         n, start = len(tokens), int(request.start_pos)
         if n == 0 or not 0 <= start < n:
             raise HandoffError(f"bad request: {n} tokens, start_pos {start}")
-        deadline = Deadline(self.cfg.timeout_s)
+        deadline = Deadline(self.cfg.prefill_timeout_s(n - start))  # scales with the prompt, as EXO's first-layer wait
         padded = tokens + [tokens[-1]] * self.cfg.effective_pad_tokens
         self._slot(deadline)
         tag = new_tag("p")
@@ -491,9 +491,10 @@ class Bridge:
         )
         return _Result(tokens=len(tokens), layers=layers, nbytes=nbytes, tag=tag)
 
-    def dsv4_result(self, tokens: list[int]) -> _Result:
-        """The converted layers for this prompt: produced once, shared by concurrent pipeline ranks."""
-        deadline = Deadline(self.cfg.timeout_s)
+    def dsv4_result(self, tokens: list[int], start_pos: int = 0) -> _Result:
+        """The converted layers for this prompt: produced once, shared by concurrent pipeline ranks. Everything happens
+        before EXO's stream is written to, so the whole budget scales with the tokens to prefill, as EXO's wait does."""
+        deadline = Deadline(self.cfg.prefill_timeout_s(len(tokens) - start_pos))
         key = token_key(tokens)
         ent = self.results.entry(key)
         arrived = time.monotonic()
@@ -520,7 +521,7 @@ class Bridge:
         proto = exo_protocol()
         tokens = [int(t) for t in request.token_ids]
         start = int(request.start_pos)
-        res = self.dsv4_result(tokens)  # raises before anything is written
+        res = self.dsv4_result(tokens, start)  # raises before anything is written
         proto.write_header(
             wfile,
             proto.Header(
@@ -558,6 +559,8 @@ def get_bridge() -> Bridge:
                 vllm=cfg.vllm_url,
                 source=cfg.transfer_url or cfg.local_store_path,
                 timeout_s=cfg.timeout_s,
+                timeout_per_1k_tokens_s=cfg.timeout_per_1k_tokens_s,
+                timeout_max_s=cfg.timeout_max_s,
                 max_inflight=cfg.max_inflight,
             )
         return _bridge

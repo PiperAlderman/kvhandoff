@@ -57,8 +57,12 @@ class ExportSource(Protocol):
 
 
 def _poll_sleep(attempt: int) -> float:
-    """Back-off for a busy transfer service (503): 5 ms growing to 100 ms."""
-    return min(0.1, 0.005 * (1.5**attempt))
+    """Back-off for a busy transfer service (503): 5 ms growing to 100 ms.
+
+    The exponent is capped, as in the bridge's stream_poll_sleep: ``1.5 ** attempt`` overflows a float after about
+    1,750 attempts, about 175 s of 503s at the 100 ms cap, which a long prompt's scaled budget can reach.
+    """
+    return min(0.1, 0.005 * (1.5 ** min(attempt, 16)))
 
 
 # wait_header runs after vLLM has answered the prefill request, when the export is a few tens of milliseconds from

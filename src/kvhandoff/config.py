@@ -197,7 +197,11 @@ class BridgeConfig:
     transfer_url: str | None = None  # fetch exports over HTTP from the transfer service ...
     transfer_token_file: str | None = None
     local_store_path: str | None = None  # ... or read them from a store on this host (paged mode, same node as vLLM)
-    timeout_s: float = 50.0  # whole hand-off budget; keep under EXO's 60 s client socket timeout
+    # Budget from EXO's request to the first layer sent (queue, vLLM prefill, export, layer 0): see prefill_timeout_s.
+    # Each later layer, and the final publish wait of a streamed hand-off, gets timeout_s on its own.
+    timeout_s: float = 50.0
+    timeout_per_1k_tokens_s: float = 4.0  # added to timeout_s per 1000 prompt tokens to prefill
+    timeout_max_s: float = 600.0  # cap on the scaled budget
     max_inflight: int = 4  # concurrent productions (vLLM prefills) from this bridge
     queue_wait_s: float = 5.0  # how long a hand-off may wait for an in-flight place before failing
     fetch_threads: int = 8  # dsv4: layer fetches in parallel, across all hand-offs of this process
@@ -231,6 +235,12 @@ class BridgeConfig:
         if wire is not None and wire not in WIRE_DTYPES:
             raise ConfigError(f"{where}: wire_dtype must be one of {WIRE_DTYPES}")
         timeout = _num(d, "timeout_s", 50.0, where, minimum=1.0)
+        # A config written before the scaled budget that sets only timeout_s keeps it as a fixed budget, as it was.
+        legacy = "timeout_s" in d and "timeout_per_1k_tokens_s" not in d and "timeout_max_s" not in d
+        per_1k = _num(d, "timeout_per_1k_tokens_s", 0.0 if legacy else 4.0, where)
+        timeout_max = _num(d, "timeout_max_s", max(600.0, timeout), where, minimum=1.0)
+        if timeout_max < timeout:
+            raise ConfigError(f"{where}: 'timeout_max_s' ({timeout_max:g}) must be >= 'timeout_s' ({timeout:g})")
         stream_layers = _bool(d, "stream_layers", False, where)
         if stream_layers and mode != "paged":
             raise ConfigError(f"{where}: stream_layers applies to paged mode only (dsv4 exports when the request ends)")
@@ -243,6 +253,8 @@ class BridgeConfig:
             transfer_token_file=token,
             local_store_path=local,
             timeout_s=timeout,
+            timeout_per_1k_tokens_s=per_1k,
+            timeout_max_s=timeout_max,
             max_inflight=_int(d, "max_inflight", 4, where, minimum=1) or 4,
             queue_wait_s=_num(d, "queue_wait_s", 5.0, where),
             fetch_threads=_int(d, "fetch_threads", 8, where, minimum=1) or 8,
@@ -260,6 +272,19 @@ class BridgeConfig:
     @property
     def effective_pad_tokens(self) -> int:
         return self.block_size + 1 if self.pad_tokens is None else self.pad_tokens
+
+    def prefill_timeout_s(self, tokens: int) -> float:
+        """Budget from EXO's request to the first layer sent, for ``tokens`` prompt tokens to prefill
+        (len(token_ids) - start_pos, the count EXO uses for its own wait):
+        min(timeout_max_s, timeout_s + timeout_per_1k_tokens_s * tokens / 1000).
+
+        EXO's client with exo-explore/exo#2575 waits EXO_REMOTE_PREFILL_WAIT_SECONDS (60) plus
+        EXO_REMOTE_PREFILL_WAIT_SECONDS_PER_1K_TOKENS (4) per 1000 tokens for the first layer. The defaults (50 s
+        plus 4 s per 1000) keep the bridge 10 s inside that at every prompt length, so a slow prefill fails here
+        first and EXO prefills locally at once. A stock EXO client waits a flat 60 s for the first byte: there, set
+        timeout_max_s = 55, which keeps the slope for short prompts and stays 5 s inside EXO at every length.
+        """
+        return min(self.timeout_max_s, self.timeout_s + self.timeout_per_1k_tokens_s * max(tokens, 0) / 1000)
 
 
 def load_toml(path: str, table: str) -> dict[str, Any]:
